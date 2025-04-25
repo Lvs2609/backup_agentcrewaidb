@@ -3,6 +3,7 @@ from embeddings import EmbeddingHandler
 from vector_store import VectorStore
 from llm_config import get_llm
 from keywords import KEYWORDS
+import re
 
 class ChatBotAgent:
     def __init__(self):
@@ -69,6 +70,7 @@ class ChatBotAgent:
                 "Khóa 20-21": 387000
             }
         }
+        # print("🔍 self.training_program:", self.training_program)
 
         self.agent = Agent(
             role="ICTU Handbook Assistant",
@@ -77,6 +79,233 @@ class ChatBotAgent:
             verbose=True,
             llm=self.llm
         )
+        
+    def is_true_false_question(self, query):
+        """Kiểm tra xem câu hỏi có phải dạng đúng/sai không"""
+        true_false_keywords = ["đúng không", "có phải", "không phải", "có đúng", "có thật", "thật không"]
+        return any(keyword in query.lower() for keyword in true_false_keywords)
+
+    def is_comparison_question(self, query):
+        """Kiểm tra xem câu hỏi có phải dạng so sánh không"""
+        comparison_keywords = ["so sánh", "khác nhau", "khác biệt", "giữa", "và", "cao hơn", "thấp hơn", "hơn"]
+        query_lower = query.lower()
+        comparison_topics = [
+            "học phí", "nội trú", "ngoại trú", "điều kiện nhập học", "chương trình đào tạo", 
+            "hoạt động ngoại khóa"
+        ]
+        return (
+            any(keyword in query_lower for keyword in comparison_keywords) and
+            any(topic in query_lower for topic in comparison_topics)
+        )
+
+    def compare_tuition_fees(self, query):
+        query_lower = query.lower()
+        majors = [m for block in self.training_program.values() for m in block["majors"]]
+        
+        # Debug: In câu hỏi và danh sách majors
+        print(f"🔍 Query Lower: {query_lower}")
+        print(f"🔍 Majors: {majors}")
+        
+        # Tìm ngành bằng regex, giữ thứ tự xuất hiện
+        found_majors = []
+        for major in majors:
+            # Tạo pattern regex cho tên ngành, thoát các ký tự đặc biệt
+            pattern = re.compile(re.escape(major.lower()), re.IGNORECASE)
+            match = pattern.search(query_lower)
+            if match and major not in found_majors:
+                found_majors.append((major, match.start()))
+        
+        # Sắp xếp theo vị trí xuất hiện
+        found_majors.sort(key=lambda x: x[1])
+        found_majors = [major for major, _ in found_majors[:2]]
+        
+        # Debug: In các ngành tìm thấy
+        print(f"🔍 Found Majors: {found_majors}")
+        
+        if len(found_majors) < 2:
+            return "Không tìm thấy đủ hai ngành để so sánh học phí. Vui lòng kiểm tra tên ngành trong câu hỏi."
+        
+        # Xác định khóa
+        course = "Khóa 18-19"  # Mặc định
+        if "khóa 17" in query_lower:
+            course = "Khóa 17"
+        elif "khóa 20-21" in query_lower or "khóa 20" in query_lower or "khóa 21" in query_lower:
+            course = "Khóa 20-21"
+        
+        # Debug: In khóa được chọn
+        print(f"🔍 Selected Course: {course}")
+        
+        # Lấy học phí
+        fees = []
+        for major in found_majors:
+            found = False
+            for block_name, block in self.training_program.items():
+                if major in block["majors"]:
+                    fee = block.get(course, block.get("Khóa 18-19"))
+                    if fee is not None:
+                        fees.append((major, course, fee))
+                        found = True
+                        break
+            if not found:
+                return f"Không tìm thấy thông tin học phí cho ngành {major} khóa {course}."
+        
+        # Debug: In học phí tìm thấy
+        print(f"🔍 Fees: {fees}")
+        
+        if len(fees) < 2:
+            return "Không tìm thấy thông tin học phí cho các ngành hoặc khóa yêu cầu."
+        
+        # So sánh học phí
+        result = []
+        fee1, fee2 = fees[0], fees[1]  # fee1: ngành A, fee2: ngành B
+        result.append(f"Ngành {fee1[0]} {fee1[1]}: {fee1[2]:,} đồng/tín chỉ")
+        result.append(f"Ngành {fee2[0]} {fee2[1]}: {fee2[2]:,} đồng/tín chỉ")
+        
+        diff = fee1[2] - fee2[2]
+        if diff > 0:
+            result.append(f"Kết quả: Học phí ngành {fee1[0]} {fee1[1]} lớn hơn ngành {fee2[0]} {fee2[1]} (chênh lệch {abs(diff):,} đồng/tín chỉ).")
+        elif diff < 0:
+            result.append(f"Kết quả: Học phí ngành {fee1[0]} {fee1[1]} nhỏ hơn ngành {fee2[0]} {fee2[1]} (chênh lệch {abs(diff):,} đồng/tín chỉ).")
+        else:
+            result.append(f"Kết quả: Học phí ngành {fee1[0]} {fee1[1]} bằng ngành {fee2[0]} {fee2[1]}.")
+        
+        return "\n".join(result)
+    
+    def compare_resident_nonresident(self, query, search_results):
+        """So sánh điểm khác nhau giữa sinh viên nội trú và ngoại trú dựa trên vector_store"""
+        query_lower = query.lower()
+        
+        # Tìm kiếm thông tin từ vector_store
+        resident_keywords = ["nội trú", "ký túc xá", "ở trong trường"]
+        nonresident_keywords = ["ngoại trú", "thuê trọ", "ở ngoài trường"]
+        resident_info = []
+        nonresident_info = []
+        
+        for result in search_results:
+            result_text = result["text"].lower()
+            if any(keyword in result_text for keyword in resident_keywords):
+                resident_info.append(result["text"])
+            if any(keyword in result_text for keyword in nonresident_keywords):
+                nonresident_info.append(result["text"])
+
+        # Tạo câu trả lời
+        result = ["**So sánh sinh viên nội trú và ngoại trú**:"]
+        
+        if resident_info or nonresident_info:
+            if resident_info:
+                result.append("Sinh viên nội trú:")
+                result.extend([f"- {info}" for info in resident_info[:3]])  # Tăng giới hạn lên 3 để có thêm thông tin
+            if nonresident_info:
+                result.append("Sinh viên ngoại trú:")
+                result.extend([f"- {info}" for info in nonresident_info[:3]])
+        else:
+            result.append("🙁 Không tìm thấy thông tin về sinh viên nội trú hoặc ngoại trú trong sổ tay ICTU.")
+
+        return "\n".join(result)
+
+    def compare_generic(self, query, search_results, topic):
+        """So sánh chung cho các chủ đề khác (ngoài học phí và nội trú/ngoại trú)"""
+        query_lower = query.lower()
+        result = [f"**So sánh về {topic}**:"]
+        
+        # Xác định từ khóa cho chủ đề
+        topic_keywords = {
+            "điều kiện nhập học": ["điều kiện nhập học", "yêu cầu nhập học", "điểm chuẩn", "xét tuyển"],
+            "chương trình đào tạo": ["chương trình đào tạo", "tín chỉ", "môn học", "kỹ sư", "cử nhân"],
+            "hoạt động ngoại khóa": ["hoạt động ngoại khóa", "điểm ngoại khóa", "sự kiện sinh viên"],
+            # Thêm các chủ đề khác nếu cần
+        }.get(topic, [])
+
+        # Tìm kiếm thông tin liên quan từ search_results
+        topic_info = []
+        for result in search_results:
+            result_text = result["text"].lower()
+            if any(keyword in result_text for keyword in topic_keywords):
+                topic_info.append(result["text"])
+
+        if topic_info:
+            # Tách thông tin theo các đối tượng so sánh (nếu có)
+            entities = []
+            for major in [m for block in self.training_program.values() for m in block["majors"]]:
+                if major.lower() in query_lower:
+                    entities.append(major)
+            if not entities:
+                entities = [keyword for keyword in topic_keywords if keyword in query_lower]
+
+            if len(entities) >= 2:
+                # So sánh giữa hai đối tượng cụ thể
+                for entity in entities:
+                    entity_info = [info for info in topic_info if entity.lower() in info.lower()]
+                    if entity_info:
+                        result.append(f"{entity}:")
+                        result.extend([f"- {info}" for info in entity_info[:2]])
+                    else:
+                        result.append(f"{entity}: Không tìm thấy thông tin chi tiết.")
+            else:
+                # Liệt kê thông tin chung cho chủ đề
+                result.append(f"Thông tin về {topic}:")
+                result.extend([f"- {info}" for info in topic_info[:3]])
+        else:
+            result.append(f"🙁 Không tìm thấy thông tin về {topic} trong sổ tay ICTU.")
+
+        return "\n".join(result)
+
+    def extract_statement(self, query):
+        """Trích xuất tuyên bố từ câu hỏi đúng/sai"""
+        for keyword in ["đúng không", "có phải", "không phải", "có đúng", "có thật", "thật không"]:
+            if keyword in query.lower():
+                statement = query.lower().replace(keyword, "").strip(" ?")
+                return statement
+        return query
+
+    def get_relevant_info(self, query):
+        """Lấy thông tin liên quan từ training_program"""
+        relevant_info = {}
+        query_lower = query.lower()
+
+        # Kiểm tra các từ khóa trong câu hỏi để lấy dữ liệu liên quan
+        if "học phí" in query_lower:
+            for block_name, block in self.training_program.items():
+                for major in block["majors"]:
+                    if major.lower() in query_lower:
+                        relevant_info[major] = {
+                            "Khóa 17": block["Khóa 17"],
+                            "Khóa 18-19": block["Khóa 18-19"],
+                            "Khóa 20-21": block["Khóa 20-21"]
+                        }
+        return relevant_info
+
+    def verify_statement(self, statement, relevant_info, search_results):
+        """Xác minh tuyên bố đúng hay sai"""
+        statement_lower = statement.lower()
+
+        # Kiểm tra thông tin từ training_program (relevant_info)
+        for major, info in relevant_info.items():
+            for course, fee in info.items():
+                # Kiểm tra nếu tuyên bố chứa thông tin về học phí
+                if major.lower() in statement_lower and course.lower() in statement_lower:
+                    fee_str = f"{fee:,} đồng/tín chỉ"
+                    if fee_str in statement_lower:
+                        return True, f"Đúng, {statement}. (Nguồn: Dữ liệu chương trình đào tạo)"
+                    else:
+                        # Tìm số tiền trong tuyên bố để so sánh
+                        import re
+                        numbers = re.findall(r'\d+', statement_lower.replace(",", ""))
+                        if numbers:
+                            stated_fee = int(numbers[0].replace(",", ""))
+                            if stated_fee == fee:
+                                return True, f"Đúng, {statement}. (Nguồn: Dữ liệu chương trình đào tạo)"
+                            else:
+                                return False, f"Sai, {statement}. Thực tế: Ngành {major} {course}: {fee:,} đồng/tín chỉ. (Nguồn: Dữ liệu chương trình đào tạo)"
+        
+        # Kiểm tra thông tin từ vector_store (search_results)
+        for result in search_results:
+            result_text = result["text"].lower()
+            if statement_lower in result_text:
+                return True, f"Đúng, {statement}. (Nguồn: Sổ tay ICTU)"
+        
+        # Nếu không tìm thấy thông tin khớp, trả về Sai
+        return False, f"Sai, không tìm thấy thông tin xác nhận cho {statement}. (Nguồn: Dữ liệu chương trình đào tạo)"
 
     def search_data(self, query, top_k=50):
         try:
@@ -236,35 +465,29 @@ class ChatBotAgent:
             return None, f"❌ Lỗi khi tìm kiếm dữ liệu: {str(e)}"
 
     def create_task(self, query, search_results):
-        context = "\n\n".join([result["text"] for result in search_results])
+        query_lower = query.lower()
+        context = "\n\n".join([result["text"] for result in search_results]) if search_results else ""
         context = context.replace("Tải về:", "").replace(".xlsm", "")
         for page in ["133", "134", "135", "136", "137", "138", "139", "140", "141", "142"]:
             context = context.replace(page, "")
-        
-        query_lower = query.lower()
+
+        # Thu thập từ khóa liên quan
         relevant_keywords = []
         for topic, keywords in self.keywords.items():
             if any(keyword in query_lower for keyword in keywords):
                 relevant_keywords.extend(keywords)
                 break
 
-        # Thêm từ khóa cho các khoa và ngành học
+        majors = [m for block in self.training_program.values() for m in block["majors"]]
         if "khoa" in query_lower or "ngành học" in query_lower or "liệt kê" in query_lower:
             relevant_keywords.extend([
                 "khoa", "ngành học", "cơ cấu tổ chức", "khoa học cơ bản", "công nghệ thông tin",
                 "công nghệ điện tử và truyền thông", "hệ thống thông tin kinh tế", "công nghệ tự động hóa",
                 "truyền thông đa phương tiện", "thương mại điện tử"
             ])
-
-        # Thêm từ khóa cho các ngành học từ bảng chương trình đào tạo
-        majors = []
-        for block in self.training_program.values():
-            majors.extend(block["majors"])
         for major in majors:
             if major.lower() in query_lower:
                 relevant_keywords.append(major)
-
-        # Thêm từ khóa cho học phí và khóa học
         if "học phí" in query_lower or "mỗi tín chỉ" in query_lower or "bao nhiêu tiền" in query_lower:
             relevant_keywords.extend(["học phí", "đồng/tín chỉ", "mỗi tín chỉ", "khóa 17", "khóa 18-19", "khóa 20-21"])
         if "khóa 17" in query_lower:
@@ -273,8 +496,15 @@ class ChatBotAgent:
             relevant_keywords.extend(["khóa 18", "khóa 19", "khóa 18-19"])
         if "khóa 20" in query_lower or "khóa 21" in query_lower or "khóa 20-21" in query_lower:
             relevant_keywords.extend(["khóa 20", "khóa 21", "khóa 20-21"])
+        if "nội trú" in query_lower or "ngoại trú" in query_lower:
+            relevant_keywords.extend(["nội trú", "ngoại trú", "ký túc xá", "thuê trọ", "ở trong trường", "ở ngoài trường"])
+        if "điều kiện nhập học" in query_lower:
+            relevant_keywords.extend(["điều kiện nhập học", "yêu cầu nhập học", "điểm chuẩn", "xét tuyển"])
+        if "chương trình đào tạo" in query_lower:
+            relevant_keywords.extend(["chương trình đào tạo", "tín chỉ", "môn học", "kỹ sư", "cử nhân"])
+        if "hoạt động ngoại khóa" in query_lower:
+            relevant_keywords.extend(["hoạt động ngoại khóa", "điểm ngoại khóa", "sự kiện sinh viên"])
 
-        # Hàm kiểm tra nội dung liên quan
         def has_relevant_content(keywords, context_lower, search_results):
             for keyword in keywords:
                 if keyword in context_lower:
@@ -293,9 +523,138 @@ class ChatBotAgent:
                     return True
                 if any(major.lower() in result_text for major in majors) and "đồng/tín chỉ" in result_text:
                     return True
+                if ("nội trú" in query_lower or "ngoại trú" in query_lower) and ("ký túc xá" in result_text or "thuê trọ" in result_text):
+                    return True
+                if "điều kiện nhập học" in query_lower and any(k in result_text for k in ["điều kiện nhập học", "yêu cầu nhập học", "điểm chuẩn"]):
+                    return True
+                if "chương trình đào tạo" in query_lower and any(k in result_text for k in ["chương trình đào tạo", "tín chỉ", "môn học"]):
+                    return True
+                if "hoạt động ngoại khóa" in query_lower and any(k in result_text for k in ["hoạt động ngoại khóa", "điểm ngoại khóa"]):
+                    return True
             return False
 
-        # Xử lý câu hỏi về học phí của một ngành cụ thể
+        # Xử lý câu hỏi so sánh
+        if self.is_comparison_question(query):
+            if "học phí" in query_lower:
+                return Task(
+                    description=f"""
+                        So sánh học phí dựa trên câu hỏi: '{query}'.
+                        ⚠️ Yêu cầu:
+                        - Trích xuất học phí từ dữ liệu chương trình đào tạo (self.training_program) cho các ngành hoặc khóa được đề cập trong câu hỏi.
+                        - Xác định ngành A (ngành được đề cập ĐẦU TIÊN trong câu hỏi) và ngành B (ngành được đề cập THỨ HAI trong câu hỏi) dựa trên thứ tự xuất hiện trong câu hỏi.
+                        - Nếu câu hỏi nêu cụ thể các ngành (ví dụ: Công nghệ thông tin, Thương mại điện tử), liệt kê học phí của ngành A trước, sau đó ngành B, theo khóa được chỉ định (hoặc mặc định Khóa 18-19 nếu không có khóa).
+                        - Nếu câu hỏi nêu các khóa (ví dụ: Khóa 17, Khóa 20-21), so sánh học phí của ngành được đề cập qua các khóa, nhưng vẫn ưu tiên thứ tự ngành A trước.
+                        - So sánh và nêu rõ điểm khác nhau, luôn lấy ngành A làm tham chiếu:
+                        - Nếu học phí ngành A lớn hơn ngành B, trả về: "Học phí ngành A lớn hơn ngành B (chênh lệch X đồng/tín chỉ)."
+                        - Nếu học phí ngành A nhỏ hơn ngành B, trả về: "Học phí ngành A nhỏ hơn ngành B (chênh lệch X đồng/tín chỉ)."
+                        - Nếu học phí bằng nhau, trả về: "Học phí ngành A bằng ngành B."
+                        - Định dạng câu trả lời rõ ràng, ví dụ:
+                        - Ngành Công nghệ thông tin Khóa 20-21: 467,700 đồng/tín chỉ
+                        - Ngành Thương mại điện tử Khóa 20-21: 403,200 đồng/tín chỉ
+                        - Điểm khác nhau: Học phí ngành Công nghệ thông tin lớn hơn ngành Thương mại điện tử (chênh lệch 64,500 đồng/tín chỉ).
+                        - Nếu không tìm thấy thông tin, trả về: "Không tìm thấy thông tin học phí cho các ngành hoặc khóa yêu cầu."
+                        - KHÔNG suy đoán, thêm thông tin ngoài, hoặc thay đổi thứ tự ngành.
+                        - PHẢI trả về CHÍNH XÁC kết quả từ self.compare_tuition_fees(query) mà KHÔNG được diễn giải lại, chỉnh sửa, hoặc thay đổi thứ tự.
+                        - Kết quả đã được tính toán sẵn trong expected_output, chỉ cần sao chép nguyên văn.
+                        - Đảm bảo thứ tự: ngành A (đầu tiên trong câu hỏi) luôn được liệt kê và so sánh trước ngành B.
+                        Chỉ trả lời bằng tiếng Việt.
+                    """,
+                    agent=self.agent,
+                    expected_output=self.compare_tuition_fees(query)
+                )
+            elif "nội trú" in query_lower or "ngoại trú" in query_lower:
+                return Task(
+                    description=f"""
+                        So sánh sinh viên nội trú và ngoại trú dựa trên câu hỏi: '{query}' từ nội dung sau:
+                        {context}
+
+                        ⚠️ Yêu cầu:
+                        - Trích xuất thông tin về sinh viên nội trú (liên quan đến "nội trú", "ký túc xá", "ở trong trường") và ngoại trú (liên quan đến "ngoại trú", "thuê trọ", "ở ngoài trường") từ nội dung cung cấp.
+                        - Liệt kê các đặc điểm của nội trú và ngoại trú, nêu rõ điểm khác nhau (ví dụ: chi phí, điều kiện sinh hoạt, quyền lợi, hạn chế).
+                        - Định dạng câu trả lời rõ ràng, ví dụ:
+                        - Sinh viên nội trú:
+                            - [Thông tin 1, ví dụ: Chi phí thấp hơn, 500,000-1,000,000 đồng/tháng]
+                            - [Thông tin 2, ví dụ: Gần trường, tiện di chuyển]
+                        - Sinh viên ngoại trú:
+                            - [Thông tin 1, ví dụ: Chi phí cao hơn, 1,500,000-3,000,000 đồng/tháng]
+                            - [Thông tin 2, ví dụ: Tự do thời gian]
+                        - Điểm khác nhau: [Tóm tắt sự khác biệt, ví dụ: Nội trú chi phí thấp hơn nhưng có giờ giới nghiêm, ngoại trú tự do hơn nhưng chi phí cao].
+                        - Chỉ trích xuất tối đa 3 thông tin cho mỗi loại để câu trả lời ngắn gọn.
+                        - Nếu không tìm thấy thông tin, trả lời: "Không tìm thấy thông tin về sinh viên nội trú hoặc ngoại trú trong sổ tay ICTU."
+                        - Không thêm thông tin ngoài nội dung cung cấp.
+                        Chỉ trả lời bằng tiếng Việt.
+                    """,
+                    agent=self.agent,
+                    expected_output=self.compare_resident_nonresident(query, search_results)
+                )
+            elif "điều kiện nhập học" in query_lower:
+                return Task(
+                    description=f"""
+                        So sánh điều kiện nhập học dựa trên câu hỏi: '{query}' từ nội dung sau:
+                        {context}
+
+                        ⚠️ Yêu cầu:
+                        - Trích xuất thông tin về điều kiện nhập học (liên quan đến "điều kiện nhập học", "yêu cầu nhập học", "điểm chuẩn", "xét tuyển") từ nội dung cung cấp.
+                        - Nếu câu hỏi nêu cụ thể các ngành (ví dụ: Công nghệ thông tin, Thương mại điện tử), liệt kê điều kiện nhập học của từng ngành và nêu điểm khác nhau (ví dụ: điểm chuẩn, tổ hợp môn, phương thức xét tuyển).
+                        - Nếu không có ngành cụ thể, cung cấp thông tin chung về điều kiện nhập học và so sánh các khía cạnh (ví dụ: xét tuyển học bạ vs thi THPT).
+                        - Định dạng câu trả lời rõ ràng, ví dụ:
+                        - Ngành X: [Điều kiện, ví dụ: Điểm chuẩn 25.5, tổ hợp A00]
+                        - Ngành Y: [Điều kiện, ví dụ: Điểm chuẩn 24.0, tổ hợp A00, D01]
+                        - Điểm khác nhau: [Tóm tắt, ví dụ: Ngành X có điểm chuẩn cao hơn, không chấp nhận D01].
+                        - Chỉ trích xuất tối đa 3 thông tin cho mỗi ngành hoặc chủ đề để ngắn gọn.
+                        - Nếu không tìm thấy thông tin, trả lời: "Không tìm thấy thông tin về điều kiện nhập học trong sổ tay ICTU."
+                        - Không thêm thông tin ngoài nội dung cung cấp.
+                        Chỉ trả lời bằng tiếng Việt.
+                    """,
+                    agent=self.agent,
+                    expected_output=self.compare_generic(query, search_results, "điều kiện nhập học")
+                )
+            elif "chương trình đào tạo" in query_lower:
+                return Task(
+                    description=f"""
+                        So sánh chương trình đào tạo dựa trên câu hỏi: '{query}' từ nội dung sau:
+                        {context}
+
+                        ⚠️ Yêu cầu:
+                        - Trích xuất thông tin về chương trình đào tạo (liên quan đến "chương trình đào tạo", "tín chỉ", "môn học", "kỹ sư", "cử nhân") từ nội dung cung cấp.
+                        - Nếu câu hỏi nêu cụ thể các ngành (ví dụ: Kỹ thuật phần mềm, Khoa học máy tính), liệt kê đặc điểm chương trình đào tạo của từng ngành và nêu điểm khác nhau (ví dụ: số tín chỉ, môn học chính, định hướng nghề nghiệp).
+                        - Nếu không có ngành cụ thể, cung cấp thông tin chung về chương trình đào tạo và so sánh các khía cạnh (ví dụ: kỹ sư vs cử nhân).
+                        - Định dạng câu trả lời rõ ràng, ví dụ:
+                        - Ngành X: [Tổng 150 tín chỉ, tập trung vào...]
+                        - Ngành Y: [Tổng 145 tín chỉ, bao gồm môn...]
+                        - Điểm khác nhau: [Tóm tắt, ví dụ: Ngành X có nhiều tín chỉ hơn, tập trung thực hành].
+                        - Chỉ trích xuất tối đa 3 thông tin cho mỗi ngành hoặc chủ đề để ngắn gọn.
+                        - Nếu không tìm thấy thông tin, trả lời: "Không tìm thấy thông tin về chương trình đào tạo trong sổ tay ICTU."
+                        - Không thêm thông tin ngoài nội dung cung cấp.
+                        Chỉ trả lời bằng tiếng Việt.
+                    """,
+                    agent=self.agent,
+                    expected_output=self.compare_generic(query, search_results, "chương trình đào tạo")
+                )
+            elif "hoạt động ngoại khóa" in query_lower:
+                return Task(
+                    description=f"""
+                        So sánh hoạt động ngoại khóa dựa trên câu hỏi: '{query}' từ nội dung sau:
+                        {context}
+
+                        ⚠️ Yêu cầu:
+                        - Trích xuất thông tin về hoạt động ngoại khóa (liên quan đến "hoạt động ngoại khóa", "điểm ngoại khóa", "sự kiện sinh viên") từ nội dung cung cấp.
+                        - Nếu câu hỏi nêu cụ thể các ngành hoặc nhóm (ví dụ: Công nghệ thông tin, Thương mại điện tử), liệt kê các hoạt động ngoại khóa liên quan đến từng ngành hoặc nhóm và nêu điểm khác nhau (ví dụ: loại sự kiện, tần suất).
+                        - Nếu không có ngành cụ thể, cung cấp thông tin chung về hoạt động ngoại khóa và so sánh các khía cạnh (ví dụ: hoạt động của khoa vs toàn trường).
+                        - Định dạng câu trả lời rõ ràng, ví dụ:
+                        - Ngành X: [Hoạt động 1, ví dụ: Cuộc thi lập trình]
+                        - Ngành Y: [Hoạt động 2, ví dụ: Hội thảo thương mại]
+                        - Điểm khác nhau: [Tóm tắt, ví dụ: Ngành X tập trung kỹ thuật, Ngành Y thiên về kinh doanh].
+                        - Chỉ trích xuất tối đa 3 thông tin cho mỗi ngành hoặc chủ đề để ngắn gọn.
+                        - Nếu không tìm thấy thông tin, trả lời: "Không tìm thấy thông tin về hoạt động ngoại khóa trong sổ tay ICTU."
+                        - Không thêm thông tin ngoài nội dung cung cấp.
+                        Chỉ trả lời bằng tiếng Việt.
+                    """,
+                    agent=self.agent,
+                    expected_output=self.compare_generic(query, search_results, "hoạt động ngoại khóa")
+                )
+
+        # Xử lý câu hỏi học phí đơn lẻ
         if any(major.lower() in query_lower for major in majors) and ("học phí" in query_lower or "mỗi tín chỉ" in query_lower or "bao nhiêu tiền" in query_lower):
             for major in majors:
                 if major.lower() in query_lower:
@@ -306,29 +665,56 @@ class ChatBotAgent:
                     if "khóa 17" in query_lower:
                         tuition_fee = block["Khóa 17"]
                         return Task(
-                            description=f"Trả lời học phí của ngành {selected_major} cho Khóa 17.",
+                            description=f"""
+                                Trả lời học phí của ngành {selected_major} cho Khóa 17.
+                                ⚠️ Yêu cầu:
+                                - Trích xuất học phí từ dữ liệu chương trình đào tạo.
+                                - Định dạng câu trả lời: "Ngành {selected_major} Khóa 17: {tuition_fee:,} đồng/tín chỉ."
+                                - Chỉ sử dụng dữ liệu từ self.training_program.
+                                Chỉ trả lời bằng tiếng Việt.
+                            """,
                             agent=self.agent,
                             expected_output=f"Ngành {selected_major} Khóa 17: {tuition_fee:,} đồng/tín chỉ."
                         )
                     elif "khóa 18-19" in query_lower or "khóa 18" in query_lower or "khóa 19" in query_lower:
                         tuition_fee = block["Khóa 18-19"]
                         return Task(
-                            description=f"Trả lời học phí của ngành {selected_major} cho Khóa 18-19.",
+                            description=f"""
+                                Trả lời học phí của ngành {selected_major} cho Khóa 18-19.
+                                ⚠️ Yêu cầu:
+                                - Trích xuất học phí từ dữ liệu chương trình đào tạo.
+                                - Định dạng câu trả lời: "Ngành {selected_major} Khóa 18-19: {tuition_fee:,} đồng/tín chỉ."
+                                - Chỉ sử dụng dữ liệu từ self.training_program.
+                                Chỉ trả lời bằng tiếng Việt.
+                            """,
                             agent=self.agent,
                             expected_output=f"Ngành {selected_major} Khóa 18-19: {tuition_fee:,} đồng/tín chỉ."
                         )
                     elif "khóa 20-21" in query_lower or "khóa 20" in query_lower or "khóa 21" in query_lower:
                         tuition_fee = block["Khóa 20-21"]
                         return Task(
-                            description=f"Trả lời học phí của ngành {selected_major} cho Khóa 20-21.",
+                            description=f"""
+                                Trả lời học phí của ngành {selected_major} cho Khóa 20-21.
+                                ⚠️ Yêu cầu:
+                                - Trích xuất học phí từ dữ liệu chương trình đào tạo.
+                                - Định dạng câu trả lời: "Ngành {selected_major} Khóa 20-21: {tuition_fee:,} đồng/tín chỉ."
+                                - Chỉ sử dụng dữ liệu từ self.training_program.
+                                Chỉ trả lời bằng tiếng Việt.
+                            """,
                             agent=self.agent,
                             expected_output=f"Ngành {selected_major} Khóa 20-21: {tuition_fee:,} đồng/tín chỉ."
                         )
                     else:
-                        # Đối với các khóa không có trong bảng, lấy học phí của Khóa 18-19
                         tuition_fee = block["Khóa 18-19"]
                         return Task(
-                            description=f"Trả lời học phí của ngành {selected_major} cho khóa không xác định (mặc định Khóa 18-19).",
+                            description=f"""
+                                Trả lời học phí của ngành {selected_major} cho khóa không xác định (mặc định Khóa 18-19).
+                                ⚠️ Yêu cầu:
+                                - Trích xuất học phí từ dữ liệu chương trình đào tạo.
+                                - Định dạng câu trả lời: "Ngành {selected_major}: {tuition_fee:,} đồng/tín chỉ (theo đơn giá Khóa 18-19 cho các khóa không xác định)."
+                                - Chỉ sử dụng dữ liệu từ self.training_program.
+                                Chỉ trả lời bằng tiếng Việt.
+                            """,
                             agent=self.agent,
                             expected_output=f"Ngành {selected_major}: {tuition_fee:,} đồng/tín chỉ (theo đơn giá Khóa 18-19 cho các khóa không xác định)."
                         )
@@ -340,75 +726,70 @@ class ChatBotAgent:
                 all_majors.extend(block["majors"])
             majors_list = "\n".join([f"- {major}" for major in all_majors])
             return Task(
-                description="Liệt kê các ngành học từ chương trình đào tạo đại trà.",
+                description=f"""
+                    Liệt kê các ngành học từ chương trình đào tạo đại trà.
+                    ⚠️ Yêu cầu:
+                    - Trích xuất danh sách ngành học từ dữ liệu chương trình đào tạo (self.training_program).
+                    - Định dạng câu trả lời:
+                    - Danh sách các ngành học tại ICTU:
+                        - [Ngành 1]
+                        - [Ngành 2]
+                        ...
+                    - Không thêm thông tin ngoài dữ liệu cung cấp.
+                    Chỉ trả lời bằng tiếng Việt.
+                """,
                 agent=self.agent,
                 expected_output=f"Danh sách các ngành học tại ICTU:\n{majors_list}"
             )
 
-        # Kiểm tra câu hỏi về khoa và ngành học
-        if "khoa" in query_lower or "ngành học" in query_lower or "liệt kê" in query_lower:
-            if not has_relevant_content(["khoa", "ngành học", "cơ cấu tổ chức"], context.lower(), search_results):
-                return Task(description="Không tìm thấy thông tin phù hợp.", agent=self.agent, expected_output="**Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU.**")
+        # Xử lý các câu hỏi khác
+        task_description = f"""
+            Trích xuất thông tin chính xác để trả lời câu hỏi: '{query}' từ nội dung sau:
+            {context}
 
-        # Nới lỏng kiểm tra cho các chủ đề khác
-        if "điều 3" in query_lower and not has_relevant_content(["điều 3", "chương trình đào tạo"], context.lower(), search_results):
-            return Task(description="Không tìm thấy thông tin phù hợp.", agent=self.agent, expected_output="**Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU.**")
-        if "cử nhân" in query_lower and not has_relevant_content(["cử nhân", "chương trình đào tạo"], context.lower(), search_results):
-            return Task(description="Không tìm thấy thông tin phù hợp.", agent=self.agent, expected_output="**Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU.**")
-        if "kỹ sư" in query_lower and not has_relevant_content(["kỹ sư", "trình độ bậc 7", "chương trình đào tạo"], context.lower(), search_results):
-            return Task(description="Không tìm thấy thông tin phù hợp.", agent=self.agent, expected_output="**Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU.**")
-        if "xếp loại học lực" in query_lower and not has_relevant_content(["xếp loại học lực", "xuất sắc", "giỏi", "khá", "trung bình", "yếu", "kém", "điểm trung bình tích lũy"], context.lower(), search_results):
-            return Task(description="Không tìm thấy thông tin phù hợp.", agent=self.agent, expected_output="**Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU.**")
-        if "xếp hạng học lực" in query_lower and not has_relevant_content(["xếp hạng học lực", "hạng bình thường", "hạng yếu", "điểm trung bình tích lũy"], context.lower(), search_results):
-            return Task(description="Không tìm thấy thông tin phù hợp.", agent=self.agent, expected_output="**Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU.**")
-        if "đăng nhập" in query_lower and not has_relevant_content(["đăng nhập", "mã sinh viên", "mật khẩu", "hệ thống"], context.lower(), search_results):
-            return Task(description="Không tìm thấy thông tin phù hợp.", agent=self.agent, expected_output="**Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU.**")
-        if "đổi mật khẩu" in query_lower and not has_relevant_content(["đổi mật khẩu", "thay đổi mật khẩu", "cập nhật mật khẩu", "quản lý tài khoản", "phòng đào tạo", "hệ thống"], context.lower(), search_results):
-            return Task(description="Không tìm thấy thông tin phù hợp.", agent=self.agent, expected_output="**Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU.**")
-        if "đăng ký học" in query_lower and not has_relevant_content(["đăng ký học", "học phần", "hệ thống", "đăng ký tín chỉ"], context.lower(), search_results):
-            return Task(description="Không tìm thấy thông tin phù hợp.", agent=self.agent, expected_output="**Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU.**")
-        if "thanh toán học phí" in query_lower or "nộp tiền trước" in query_lower:
-            if not has_relevant_content(["thanh toán học phí", "online", "đăng ký học kỳ tới", "nộp tiền trước", "chức năng thanh toán", "hệ thống"], context.lower(), search_results):
-                return Task(description="Không tìm thấy thông tin phù hợp.", agent=self.agent, expected_output="**Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU.**")
-        if any(major.lower() in query_lower for major in majors) and ("học phí" in query_lower or "mỗi tín chỉ" in query_lower or "bao nhiêu tiền" in query_lower):
-            if not has_relevant_content(majors + ["học phí", "đồng/tín chỉ", "mỗi tín chỉ"], context.lower(), search_results):
-                return Task(description="Không tìm thấy thông tin phù hợp.", agent=self.agent, expected_output="**Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU.**")
+            ⚠️ Yêu cầu:
+            - Chỉ trích xuất đúng nội dung liên quan nhất từ đoạn văn trên.
+            - Ưu tiên các đoạn văn chứa các từ khóa: {', '.join(relevant_keywords)}.
+            - Nếu câu hỏi hỏi về "liệt kê các khoa" hoặc "các khoa tại ICTU", trích xuất danh sách các khoa từ các đoạn văn chứa từ khóa "khoa" và liệt kê đầy đủ.
+            - Nếu câu hỏi hỏi về "ngành học" hoặc "liệt kê các ngành học", trích xuất thông tin về các ngành học nếu có. Nếu không, suy luận từ tên khoa (ví dụ: Khoa Công nghệ Thông tin có thể có ngành Công nghệ Thông tin) và ghi rõ là suy luận.
+            - Nếu câu hỏi hỏi về "xếp loại học lực", trích xuất các đoạn chứa "xếp loại học lực", "xuất sắc", "giỏi", "khá", "trung bình", "yếu", "kém", hoặc "điểm trung bình tích lũy".
+            - Nếu câu hỏi hỏi về "xếp hạng học lực", trích xuất các đoạn chứa "xếp hạng học lực", "hạng bình thường", "hạng yếu", hoặc "điểm trung bình tích lũy".
+            - Nếu câu hỏi hỏi về "đăng nhập", trích xuất các đoạn chứa "đăng nhập", "mã sinh viên", "mật khẩu", "ngày tháng năm sinh", "viết hoa", "hệ thống".
+            - Nếu câu hỏi hỏi về "đổi mật khẩu", trích xuất các đoạn chứa "đổi mật khẩu", "thay đổi mật khẩu", "cập nhật mật khẩu", "quản lý tài khoản", "phòng đào tạo", "hệ thống".
+            - Nếu câu hỏi hỏi về "đăng ký học", trích xuất các đoạn chứa "đăng ký học", "học phần", "hệ thống", "đăng ký tín chỉ".
+            - Nếu câu hỏi hỏi về "thanh toán học phí" hoặc "nộp tiền trước", trích xuất các đoạn chứa "thanh toán học phí", "online", "đăng ký học kỳ tới", "nộp tiền trước", "chức năng thanh toán", "hệ thống".
+            - Nếu câu hỏi hỏi về "nội trú" hoặc "ngoại trú", trích xuất các đoạn văn chứa "nội trú", "ngoại trú", "ký túc xá", "thuê trọ", "ở trong trường", "ở ngoài trường".
+            - Nếu câu hỏi hỏi về "điều kiện nhập học", trích xuất các đoạn văn chứa "điều kiện nhập học", "yêu cầu nhập học", "điểm chuẩn", "xét tuyển".
+            - Nếu câu hỏi hỏi về "chương trình đào tạo", trích xuất các đoạn văn chứa "chương trình đào tạo", "tín chỉ", "môn học", "kỹ sư", "cử nhân".
+            - Nếu câu hỏi hỏi về "hoạt động ngoại khóa", trích xuất các đoạn văn chứa "hoạt động ngoại khóa", "điểm ngoại khóa", "sự kiện sinh viên".
+            - Nếu câu hỏi không thuộc các chủ đề trên, trích xuất các đoạn văn liên quan nhất dựa trên từ khóa và ngữ nghĩa của câu hỏi.
+            - KHÔNG được viết lại, diễn giải lại hay sáng tạo thêm thông tin ngoài nội dung cung cấp.
+            - Nếu trong đoạn văn có câu trả lời trực tiếp, trích nguyên văn.
+            - Nếu không tìm thấy thông tin phù hợp, trả lời: **"Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU."**
 
+            Chỉ trả lời bằng tiếng Việt.
+        """
         task = Task(
-            description=f"""
-                Trích xuất thông tin chính xác để trả lời câu hỏi: '{query}' từ nội dung sau:
-                {context}
-
-                ⚠️ Yêu cầu:
-                - Chỉ trích xuất đúng nội dung liên quan nhất từ đoạn văn trên.
-                - Ưu tiên các đoạn văn chứa các từ khóa: {', '.join(relevant_keywords)}.
-                - Nếu câu hỏi hỏi về "liệt kê các khoa" hoặc "các khoa tại ICTU", trích xuất danh sách các khoa từ các đoạn văn chứa từ khóa "khoa" và liệt kê đầy đủ.
-                - Nếu câu hỏi hỏi về "ngành học" hoặc "liệt kê các ngành học", trích xuất thông tin về các ngành học nếu có (ví dụ: "Thương mại điện tử" từ các đoạn văn liên quan). Nếu không có thông tin chi tiết về ngành học, suy luận ngành học dựa trên tên khoa (ví dụ: Khoa Công nghệ Thông tin có thể đào tạo ngành Công nghệ Thông tin) và ghi rõ rằng đây là suy luận.
-                - Nếu câu hỏi hỏi về "số lượng ngành học", đếm số lượng ngành học dựa trên thông tin có sẵn hoặc suy luận từ tên khoa, và ghi rõ nếu là suy luận.
-                - Nếu câu hỏi hỏi về "xếp loại học lực", chỉ trích xuất các đoạn chứa "xếp loại học lực", "xuất sắc", "giỏi", "khá", "trung bình", "yếu", "kém", hoặc "điểm trung bình tích lũy".
-                - Nếu câu hỏi hỏi về "xếp hạng học lực", chỉ trích xuất các đoạn chứa "xếp hạng học lực", "hạng bình thường", "hạng yếu", hoặc "điểm trung bình tích lũy".
-                - Nếu câu hỏi hỏi về cả "xếp loại học lực" và "xếp hạng học lực", trích xuất cả hai nội dung và trình bày rõ ràng, phân tách bằng dấu xuống dòng.
-                - Nếu câu hỏi hỏi về "đăng nhập", chỉ trích xuất các đoạn chứa "đăng nhập", "mã sinh viên", "mật khẩu", "ngày tháng năm sinh", "viết hoa", "hệ thống".
-                - Nếu câu hỏi hỏi về "đổi mật khẩu", chỉ trích xuất các đoạn chứa "đổi mật khẩu", "thay đổi mật khẩu", "cập nhật mật khẩu", "quản lý tài khoản", "phòng đào tạo", "hệ thống".
-                - Nếu câu hỏi hỏi về "đăng ký học", chỉ trích xuất các đoạn chứa "đăng ký học", "học phần", "hệ thống", "đăng ký tín chỉ".
-                - Nếu câu hỏi hỏi về "thanh toán học phí" hoặc "nộp tiền trước", chỉ trích xuất các đoạn chứa "thanh toán học phí", "online", "đăng ký học kỳ tới", "nộp tiền trước", "chức năng thanh toán", "hệ thống". Nếu câu hỏi có cụm "nộp tiền trước", ưu tiên các đoạn văn chứa "nộp tiền trước" và mô tả quy trình nộp tiền.
-                - Nếu câu hỏi hỏi về "hủy học phần", chỉ trích xuất các đoạn chứa "hủy học phần", "đăng ký nhầm".
-                - Nếu câu hỏi hỏi về "xem lịch thi", chỉ trích xuất các đoạn chứa "xem lịch thi", "học kỳ", "đợt học".
-                - Nếu câu hỏi hỏi về "tra cứu điểm", chỉ trích xuất các đoạn chứa "tra cứu điểm", "học kỳ".
-                - Nếu câu hỏi không thuộc các chủ đề trên, trích xuất các đoạn văn liên quan nhất dựa trên từ khóa và ngữ nghĩa của câu hỏi.
-                - KHÔNG được viết lại, diễn giải lại hay sáng tạo thêm.
-                - KHÔNG cần tóm tắt.
-                - Nếu trong đoạn văn có câu trả lời trực tiếp, hãy trích nguyên văn.
-                - Nếu không tìm thấy thông tin phù hợp, trả lời: **"Không tìm thấy thông tin về chủ đề này trong sổ tay ICTU."**
-
-                Chỉ trả lời bằng tiếng Việt.
-                """,
+            description=task_description,
             agent=self.agent,
-            expected_output="Câu trả lời chính xác, không tóm tắt, không viết lại, chỉ trích xuất đúng thông tin từ đoạn văn."
+            expected_output="Trích xuất nguyên văn thông tin liên quan từ đoạn văn, không tóm tắt, không diễn giải."
         )
         return task
+    
+    def run(self, query, top_k=5):
+        # Kiểm tra nếu câu hỏi là dạng đúng/sai
+        if self.is_true_false_question(query):
+            statement = self.extract_statement(query)
+            search_results, error = self.search_data(query, top_k)
+            if error:
+                print(error)
+                return error
+            relevant_info = self.get_relevant_info(query)
+            is_true, explanation = self.verify_statement(statement, relevant_info, search_results)
+            self.chat_history.append((query, explanation))
+            return explanation
 
-    def run(self, query, top_k=50):
+        # Xử lý các câu hỏi thông tin bình thường
         search_results, error = self.search_data(query, top_k)
         print("\n💬 Kết quả tìm kiếm từ Qdrant:")
         if error:
@@ -425,32 +806,35 @@ class ChatBotAgent:
         print("\n📝 Diễn giải và trả lời câu hỏi bằng LLM...")
         try:
             task = self.create_task(query, search_results)
+            # Debug: In expected_output
+            print("\n🔍 Expected Output từ compare_tuition_fees:")
+            print(task.expected_output)
             crew = Crew(agents=[self.agent], tasks=[task], verbose=2)
             result = crew.kickoff()
             # Lấy ID từ kết quả có nội dung khớp với câu trả lời
             if search_results:
                 relevant_result = None
                 for res in search_results:
-                    # So sánh chính xác hơn bằng cách kiểm tra xem result có phải là một phần của res['text']
                     if result.strip() in res['text'].strip():
                         relevant_result = res
                         break
                 if not relevant_result:
-                    # Nếu không tìm thấy khớp chính xác, thử tìm kiếm dựa trên từ khóa chính trong result
                     for res in search_results:
                         if "Đoàn thanh niên" in res['text'] and "Nhà điều hành C1" in res['text']:
                             relevant_result = res
                             break
                 if not relevant_result:
-                    relevant_result = search_results[0]  # Mặc định lấy kết quả có score cao nhất nếu không tìm thấy
-                result_with_id = f"{result} (ID: {relevant_result['metadata']['id']})"
+                    relevant_result = search_results[0]
+                result_with_id = result
             else:
                 result_with_id = result
+            self.chat_history.append((query, result_with_id))
             return result_with_id
         except Exception as e:
             error_msg = f"❌ Lỗi khi diễn giải dữ liệu: {str(e)}"
             print(error_msg)
             return error_msg
+
 
 if __name__ == "__main__":
     print("🚀 Khởi động ChatBotAgent...")
@@ -475,7 +859,7 @@ if __name__ == "__main__":
 
             # Xử lý câu hỏi và in phản hồi
             print(f"\n📝 Đang xử lý câu hỏi: {query}")
-            response = bot.run(query, top_k=18)
+            response = bot.run(query, top_k=12)
             print("\n💬 Phản hồi từ trợ lý:")
             print(response)
             print("\n" + "="*50)
